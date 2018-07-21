@@ -9,9 +9,6 @@ import org.apache.kafka.common.serialization.IntegerDeserializer;
 import org.apache.kafka.common.serialization.StringDeserializer;
 
 import java.util.*;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -19,46 +16,49 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public class KafkaNativeConsumerGroup {
 
-    public void shutdownConsumerGroup() {
-        this.stopGroup = true;
-    }
+    private List<NativeConsumerAdaptor> consumers = new LinkedList<>();
+    private Map<String, Integer> topicConsumerCount = new HashMap<>();
 
-    public synchronized boolean addConsumers(List<ConsumeCallback> callbacks) {
-        if (getConsumerCount() >= MAX_SIZE) {
+    public synchronized boolean addConsumers(List<ConsumeCallback> callbacks) { // need to keep the consumers less than the partitions
+        if (threadCount.get() >= MAX_SIZE
+                || callbacks.size() + threadCount.get() > MAX_SIZE) {
             return false;   // reject new callbacks(topic)
         }
 
-        callbacks.forEach(callback -> addConsumer(callback));
+        callbacks.forEach(callback -> addConsumer(callback, 1));
         return true;
     }
 
-    private synchronized void addConsumer(ConsumeCallback callback) {
-        if (getConsumerCount() >= MAX_SIZE) return;
+    private synchronized void addConsumer(ConsumeCallback callback, int partitionCount) {   // partition control count
+        if (threadCount.get() >= MAX_SIZE ||
+                topicConsumerCount.getOrDefault(callback.getTopic(), 0) >= partitionCount) return;
 
-        NativeConsumerAdaptor adaptor = new NativeConsumerAdaptor();
+        NativeConsumerAdaptor adaptor = new NativeConsumerAdaptor(callback);
         consumers.add(adaptor);
         topicConsumerCount.putIfAbsent(callback.getTopic(), 0);
         topicConsumerCount.put(callback.getTopic(), topicConsumerCount.get(callback.getTopic()) + 1);
-        adaptor.initAndInvokeConsumer(callback);
+
+        Thread worker = new Thread(() -> adaptor.pollAndInvoke(),
+                THREAD_NAME_PREFIX + threadCount.getAndIncrement());
+        worker.start();
     }
 
     private synchronized void removeConsumer(NativeConsumerAdaptor adaptor) {
-        if (getTopicConsumerCount(adaptor.callback.getTopic()) <= 1) return;
+        if (threadCount.get() < CORE_SIZE
+                || getTopicConsumerCount(adaptor.callback.getTopic()) <= 1) return;
 
-        adaptor.stopConsumer = true;
         Iterator<NativeConsumerAdaptor> iterator = consumers.iterator();
         while (iterator.hasNext()) {
             NativeConsumerAdaptor current = iterator.next();
             if (current == adaptor && current.equals(adaptor)) {
+
                 iterator.remove();
+                adaptor.stopConsumer = true;
                 topicConsumerCount.put(current.callback.getTopic(), topicConsumerCount.get(current.callback.getTopic()) - 1);
+                threadCount.getAndDecrement();
                 break;
             }
         }
-    }
-
-    private synchronized int getConsumerCount() {
-        return consumers.size();
     }
 
     private synchronized int getTopicConsumerCount(String topic) {
@@ -73,85 +73,61 @@ public class KafkaNativeConsumerGroup {
 
         private int sequentSuccessfulPoll = 0;
         private int sequentEmptyPoll = 0;
-        private static final int SEQUENT_THRESHOLD = 10;
 
-        void initAndInvokeConsumer(ConsumeCallback callback) {
-            consumer = new KafkaConsumer<>(defaultConsumerProperties());
+        NativeConsumerAdaptor(ConsumeCallback callback) {
             this.callback = callback;
-            consumer.subscribe(Arrays.asList(this.callback.getTopic()));
-
-            executor.execute(() -> pollAndInvoke());    // TODO
+            consumer = new KafkaConsumer<>(defaultConsumerProperties());
+            consumer.subscribe(Arrays.asList(this.callback.getTopic()));    // handle exception
         }
 
         void pollAndInvoke() {
             boolean success = false;
-            boolean polled = false;
+            boolean failureOnFailure = false;
             ConsumerRecords<Integer, String> records = null;
             while (!stopConsumer && !stopGroup) {
                 try {
                     success = false;
-                    polled = false;
+                    failureOnFailure = false;
                     if (null == records) {  // new poll
                         records = consumer.poll(DEFAULT_POLL_TIMEOUT);
                         if (null != records && !records.isEmpty()) {
-                            polled = true;
-                            sequentSuccessfulPoll++;
-                            sequentEmptyPoll = 0;
-                            if (sequentSuccessfulPoll > SEQUENT_THRESHOLD && getConsumerCount() < MAX_SIZE
-                                    && getTopicConsumerCount(callback.getTopic()) < consumer.partitionsFor(callback.getTopic()).size()) {
+                            if (sequentSuccessfulPoll < SEQUENT_COUNT_TO_ADD_WORKER)
+                                sequentSuccessfulPoll++;
 
-                                addConsumer(callback.cloneConsumer());
-                                sequentSuccessfulPoll = 0;
-                            }
+                            sequentEmptyPoll = 0;
+                            checkIfAddWorker();
 
                             callback.onMessage(records);
                             success = true;
-                        } else {
-                            records = null;
+                        } else {            // empty polled
+                            records = null; // discard empty poll result
+
                             sequentSuccessfulPoll = 0;
-                            sequentEmptyPoll++;
-
-                            if (sequentEmptyPoll > SEQUENT_THRESHOLD * 60 && getConsumerCount() > CORE_SIZE
-                                    && getTopicConsumerCount(callback.getTopic()) > 1) {
-                                removeConsumer(this);
-                                sequentEmptyPoll = 0;
-                            }
+                            if (sequentEmptyPoll < SEQUENT_COUNT_TO_REMOVE_WORKER)  // in case of overflow
+                                sequentEmptyPoll++;
+                            checkIfRemoveWorker();
                         }
-                        if (sequentSuccessfulPoll > SEQUENT_THRESHOLD || sequentEmptyPoll > SEQUENT_THRESHOLD * 60)
-                            System.out.printf("sequent success [%d], sequent empty [%d]\r\n", sequentSuccessfulPoll, sequentEmptyPoll);
+                        debugLog();
 
-                    } else {
-                        polled = true;
+                    } else {    // handle consume failure
                         try {
-                            failureStrategy.onConsumeFailure(consumer, records, callback);
+                            failureStrategy.onConsumeFailure(consumer, records, callback);  // local server in error state
                         } catch (Throwable fscst) {
                             // TODO handle strategy failure
+                            failureOnFailure = true;
                         }
-                        records = null;
                     }
                 } catch (Throwable throwable) {
                     // TODO handle exception
+                    success = false;
                 } finally {
                     try {
                         if (success) {
-                            try {
-                                consumer.commitSync();
-
-                            } catch (Throwable ct) {
-                                try {
-                                    failureStrategy.onCommitFailure(consumer, records);
-                                } catch (Throwable fscmt) {
-                                    // TODO handle strategy failure
-                                }
-                            } finally {
-                                records = null;
-                            }
-                        } else if (polled && !success && null == records) { // 重新连接的时候会自动从offset
-                            Set<TopicPartition> topicPartitions = records.partitions();
-                            for (TopicPartition topicPartition : topicPartitions) {
-                                OffsetAndMetadata offsetAndMetadata = consumer.committed(topicPartition);
-                                consumer.seek(topicPartition, offsetAndMetadata.offset());
-                            }
+                            handleCommit(records);
+                            records = null; // discard records no matter commit successfully or not
+                        } else if (failureOnFailure) {  // maybe fall in loop, try to recover from local error
+                            seekToLastPoll(records);
+                            records = null;
                         }
                     } catch (Throwable ft) {
                         ft.printStackTrace();
@@ -159,15 +135,63 @@ public class KafkaNativeConsumerGroup {
                 }
             }
 
-            if (stopConsumer || stopGroup) {
-                consumer.close();
+            consumer.close();
+        }
+
+        private void checkIfAddWorker() {
+            if (sequentSuccessfulPoll > SEQUENT_COUNT_TO_ADD_WORKER && threadCount.get() < MAX_SIZE
+                    && getTopicConsumerCount(callback.getTopic()) < consumer.partitionsFor(callback.getTopic()).size()) {
+
+                addConsumer(callback.cloneConsumer(), consumer.partitionsFor(callback.getTopic()).size());
+                sequentSuccessfulPoll = 0;
             }
         }
+
+        private void checkIfRemoveWorker() {
+            if (sequentEmptyPoll > SEQUENT_COUNT_TO_REMOVE_WORKER && threadCount.get() > CORE_SIZE
+                    && getTopicConsumerCount(callback.getTopic()) > 1) {
+                removeConsumer(this);
+                sequentEmptyPoll = 0;
+            }
+        }
+
+        private void handleCommit(ConsumerRecords<Integer, String> records) {
+            try {
+                consumer.commitSync();
+            } catch (Throwable ct) {
+                try {
+                    failureStrategy.onCommitFailure(consumer, records); // kafka in unrecoverable state
+                } catch (Throwable fscmt) {
+                    // TODO handle strategy failure
+                }
+            }
+        }
+
+        private void seekToLastPoll(ConsumerRecords<Integer, String> records) {
+            Set<TopicPartition> topicPartitions = records.partitions();
+            for (TopicPartition topicPartition : topicPartitions) {
+                OffsetAndMetadata offsetAndMetadata = consumer.committed(topicPartition);
+                consumer.seek(topicPartition, offsetAndMetadata.offset());
+            }
+        }
+
+        private void debugLog() {
+            if (sequentSuccessfulPoll > SEQUENT_COUNT_TO_ADD_WORKER
+                    || sequentEmptyPoll > SEQUENT_COUNT_TO_REMOVE_WORKER)
+                System.out.printf("sequent success [%d], sequent empty [%d]\r\n", sequentSuccessfulPoll, sequentEmptyPoll);
+        }
+
+        private static final int DEFAULT_POLL_TIMEOUT = 100;  // ms
+        private static final int SEQUENT_COUNT_TO_ADD_WORKER = 10;  // 10 * 100ms = 1s
+        private static final int SEQUENT_COUNT_TO_REMOVE_WORKER = SEQUENT_COUNT_TO_ADD_WORKER * 60; // 1s * 60 = 1m
     }
 
     private volatile boolean stopGroup = false;
-    private List<NativeConsumerAdaptor> consumers = new LinkedList<>();
-    private Map<String, Integer> topicConsumerCount = new HashMap<>();
+
+    public void shutdownConsumerGroup() {
+        this.stopGroup = true;
+    }
+
     private FailureStrategy<Integer, String> failureStrategy = new SimpleDiscardFailureStrategy();
 
     private Properties props = new Properties();
@@ -182,17 +206,11 @@ public class KafkaNativeConsumerGroup {
         return props;
     }
 
-    private static final int DEFAULT_POLL_TIMEOUT = 100;  // ms
-
     private AtomicInteger threadCount = new AtomicInteger(0);
-    private ThreadPoolExecutor executor =
-            new ThreadPoolExecutor(CORE_SIZE, MAX_SIZE, TIME_TO_LIVE, TimeUnit.SECONDS,
-                    new LinkedBlockingQueue<>(1), r -> new Thread(r, THREAD_NAME_PREFIX + threadCount.getAndIncrement()));
 
     private static final String CONSUMER_GROUP_NAME = "KafkaNativeConsumerGroup";
 
     private static final String THREAD_NAME_PREFIX = "Kafka_consumer_";
     private static final int CORE_SIZE = 1;
-    private static final int MAX_SIZE = 50;
-    private static final int TIME_TO_LIVE = 180;
+    private static final int MAX_SIZE = 20;
 }
