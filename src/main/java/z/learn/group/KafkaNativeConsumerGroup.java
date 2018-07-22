@@ -42,9 +42,10 @@ public class KafkaNativeConsumerGroup {
         topicConsumerCount.put(callback.getTopic(), topicConsumerCount.get(callback.getTopic()) + 1);
 
         Thread worker = new Thread(() -> adaptor.pollAndInvoke(),
-                THREAD_NAME_PREFIX + threadCount.getAndIncrement());
+                THREAD_NAME_PREFIX + threadName++);
         worker.start();
 
+        threadCount.getAndIncrement();
         System.out.println("--- Consumer added---- : " + worker.getName());
     }
 
@@ -157,7 +158,7 @@ public class KafkaNativeConsumerGroup {
         }
 
         private void checkIfAddWorker() {
-            if (sequentSuccessfulPoll > SEQUENT_COUNT_TO_ADD_WORKER && threadCount.get() < MAX_SIZE
+            if (sequentSuccessfulPoll >= SEQUENT_COUNT_TO_ADD_WORKER && threadCount.get() < MAX_SIZE
                     && getTopicConsumerCount(callback.getTopic()) < consumer.partitionsFor(callback.getTopic()).size()) {
 
                 addConsumer(callback.cloneConsumer(), consumer.partitionsFor(callback.getTopic()).size());
@@ -166,7 +167,7 @@ public class KafkaNativeConsumerGroup {
         }
 
         private void checkIfRemoveWorker() {
-            if (sequentEmptyPoll > SEQUENT_COUNT_TO_REMOVE_WORKER && threadCount.get() > CORE_SIZE
+            if (sequentEmptyPoll >= SEQUENT_COUNT_TO_REMOVE_WORKER && threadCount.get() > CORE_SIZE
                     && getTopicConsumerCount(callback.getTopic()) > 1) {
                 removeConsumer(this);
                 sequentEmptyPoll = 0;
@@ -231,6 +232,7 @@ public class KafkaNativeConsumerGroup {
     }
 
     private AtomicInteger threadCount = new AtomicInteger(0);
+    private int threadName = 0;
 
     private static final String CONSUMER_GROUP_NAME = "KafkaNativeConsumerGroup";
 
