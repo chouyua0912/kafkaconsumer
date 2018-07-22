@@ -5,6 +5,7 @@ import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.SerializationException;
 import org.apache.kafka.common.serialization.IntegerDeserializer;
 import org.apache.kafka.common.serialization.StringDeserializer;
 
@@ -13,11 +14,13 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * initiate new thread to consume based on load
+ * TODO add cluster control on consumers
  */
 public class KafkaNativeConsumerGroup {
 
     private List<NativeConsumerAdaptor> consumers = new LinkedList<>();
     private Map<String, Integer> topicConsumerCount = new HashMap<>();
+    private FailureStrategy<Integer, String> failureStrategy = new SimpleDiscardFailureStrategy();
 
     public synchronized boolean addConsumers(List<ConsumeCallback> callbacks) { // need to keep the consumers less than the partitions
         if (threadCount.get() >= MAX_SIZE
@@ -41,6 +44,8 @@ public class KafkaNativeConsumerGroup {
         Thread worker = new Thread(() -> adaptor.pollAndInvoke(),
                 THREAD_NAME_PREFIX + threadCount.getAndIncrement());
         worker.start();
+
+        System.out.println("--- Consumer added---- : " + worker.getName());
     }
 
     private synchronized void removeConsumer(NativeConsumerAdaptor adaptor) {
@@ -56,6 +61,7 @@ public class KafkaNativeConsumerGroup {
                 adaptor.stopConsumer = true;
                 topicConsumerCount.put(current.callback.getTopic(), topicConsumerCount.get(current.callback.getTopic()) - 1);
                 threadCount.getAndDecrement();
+                System.out.println("--- Consumer removed --- : " + Thread.currentThread().getName());
                 break;
             }
         }
@@ -80,14 +86,19 @@ public class KafkaNativeConsumerGroup {
             consumer.subscribe(Arrays.asList(this.callback.getTopic()));    // handle exception
         }
 
+        // heartbeat.interval.ms default 3000, session.timeout.ms default 10000
+        // max.poll.interval.ms default 300000
         void pollAndInvoke() {
             boolean success = false;
-            boolean failureOnFailure = false;
+            boolean failOnFailure = false;
             ConsumerRecords<Integer, String> records = null;
+
+            failureStrategy.onStartup(consumer, callback);  //
+
             while (!stopConsumer && !stopGroup) {
                 try {
                     success = false;
-                    failureOnFailure = false;
+                    failOnFailure = false;
                     if (null == records) {  // new poll
                         records = consumer.poll(DEFAULT_POLL_TIMEOUT);
                         if (null != records && !records.isEmpty()) {
@@ -111,29 +122,36 @@ public class KafkaNativeConsumerGroup {
 
                     } else {    // handle consume failure
                         try {
-                            failureStrategy.onConsumeFailure(consumer, records, callback);  // local server in error state
+                            failureStrategy.onConsumeFailure(consumer, records, callback);  // local server in error state, try to recover
+                            success = true;
                         } catch (Throwable fscst) {
-                            // TODO handle strategy failure
-                            failureOnFailure = true;
+                            failOnFailure = true;
+                            System.err.println("130 exception: " + fscst.getMessage());
                         }
                     }
+                } catch (SerializationException se) {
+                    se.printStackTrace();
                 } catch (Throwable throwable) {
-                    // TODO handle exception
                     success = false;
+                    System.err.println("137 exception: " + throwable.getMessage());
                 } finally {
                     try {
                         if (success) {
                             handleCommit(records);
                             records = null; // discard records no matter commit successfully or not
-                        } else if (failureOnFailure) {  // maybe fall in loop, try to recover from local error
-                            seekToLastPoll(records);
-                            records = null;
+                        } else if (failOnFailure) {     // maybe fall in loop
+                            seekToLastCommittedPoll(records);    // seek to last poll and poll again
+                            records = null;             // keep polling will leave consumer stay in the group. Controlled by max.poll.interval.ms
+
+                            Thread.sleep(FAIL_ON_FAILURE_RETRY_WAIT_TIME);  // TODO should we let consumer to leave the group
                         }
                     } catch (Throwable ft) {
                         ft.printStackTrace();
                     }
                 }
             }
+
+            failureStrategy.onShutdown(consumer, callback);
 
             consumer.close();
         }
@@ -158,6 +176,7 @@ public class KafkaNativeConsumerGroup {
         private void handleCommit(ConsumerRecords<Integer, String> records) {
             try {
                 consumer.commitSync();
+                System.out.println("-- Committed --" + records.toString());
             } catch (Throwable ct) {
                 try {
                     failureStrategy.onCommitFailure(consumer, records); // kafka in unrecoverable state
@@ -167,11 +186,16 @@ public class KafkaNativeConsumerGroup {
             }
         }
 
-        private void seekToLastPoll(ConsumerRecords<Integer, String> records) {
+        private void seekToLastCommittedPoll(ConsumerRecords<Integer, String> records) {
             Set<TopicPartition> topicPartitions = records.partitions();
             for (TopicPartition topicPartition : topicPartitions) {
                 OffsetAndMetadata offsetAndMetadata = consumer.committed(topicPartition);
-                consumer.seek(topicPartition, offsetAndMetadata.offset());
+                if (null == offsetAndMetadata)
+                    consumer.seek(topicPartition, 0);
+                else
+                    consumer.seek(topicPartition, offsetAndMetadata.offset());
+
+                System.out.println("-- Seek to Last Committed --" + topicPartition.toString());
             }
         }
 
@@ -184,6 +208,7 @@ public class KafkaNativeConsumerGroup {
         private static final int DEFAULT_POLL_TIMEOUT = 100;  // ms
         private static final int SEQUENT_COUNT_TO_ADD_WORKER = 10;  // 10 * 100ms = 1s
         private static final int SEQUENT_COUNT_TO_REMOVE_WORKER = SEQUENT_COUNT_TO_ADD_WORKER * 60; // 1s * 60 = 1m
+        private static final int FAIL_ON_FAILURE_RETRY_WAIT_TIME = 10 * 1000; // ms
     }
 
     private volatile boolean stopGroup = false;
@@ -192,8 +217,6 @@ public class KafkaNativeConsumerGroup {
         this.stopGroup = true;
     }
 
-    private FailureStrategy<Integer, String> failureStrategy = new SimpleDiscardFailureStrategy();
-
     private Properties props = new Properties();
 
     private Properties defaultConsumerProperties() {
@@ -201,6 +224,7 @@ public class KafkaNativeConsumerGroup {
         props.put(ConsumerConfig.GROUP_ID_CONFIG, CONSUMER_GROUP_NAME);
         props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
         props.put(ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG, "15000");
+        props.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, 100); // 1s = 1000 records, 60000 records a minute
         props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, IntegerDeserializer.class);
         props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
         return props;

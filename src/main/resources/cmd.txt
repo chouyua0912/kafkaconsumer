@@ -25,6 +25,9 @@ This is another message
 
 
 bin/kafka-console-producer.sh --broker-list localhost:9092 --topic test2
+
+bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic test2 --from-beginning
+
 bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic test2 --partition 2 --from-beginning
 
 bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic test2 --partition 1 --from-beginning
